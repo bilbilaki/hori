@@ -1,19 +1,15 @@
-
+import 'package:hori/main.dart';
 import 'package:openai_dart/openai_dart.dart';
 
 /// Service for handling translation via OpenAI API.
 class TranslationService {
   OpenAIClient? _client;
-////TODO Creating field with default value openai.com and complete customizable by user with shared prefs too can save value 
-  void setApiKey(String apiKey) {
-    if (apiKey.isNotEmpty) {
-      _client = OpenAIClient(
-        apiKey: apiKey,
-        baseUrl: "https://api.avalai.org/v1",
-      );
-    } else {
-      _client = null;
-    }
+  ////TODO Creating field with default value openai.com and complete customizable by user with shared prefs too can save value
+  void setApiKey() {
+    _client = OpenAIClient(
+      apiKey: translatorConfig.apiKey,
+      baseUrl: translatorConfig.baseUrl,
+    );
   }
 
   Future<String> _translateTextChunk(String text, String targetLanguage) async {
@@ -27,12 +23,12 @@ class TranslationService {
     }
 
     final prompt =
-        'Translate the following text to $targetLanguage. Return only the translated text, without any introductory phrases or explanations.';
-////TODO add model and model params salector and save that per user device by Shared Prefs
+        '${translatorConfig.systemPrompt} ${translatorConfig.outputLang}';
+    //   'Translate the following text to $targetLanguage. Return only the translated text, without any introductory phrases or explanations.';
     try {
       final res = await _client!.createChatCompletion(
         request: CreateChatCompletionRequest(
-          model: const ChatCompletionModel.modelId('gemini-2.5-flash-lite'),
+          model: ChatCompletionModel.modelId(translatorConfig.modelId),
           messages: [
             ChatCompletionMessage.user(
               content: ChatCompletionUserMessageContent.string(
@@ -40,7 +36,7 @@ class TranslationService {
               ),
             ),
           ],
-          temperature: 0.2,
+          temperature: translatorConfig.temp,
         ),
       );
       return res.choices.first.message.content?.trim() ??
@@ -54,8 +50,8 @@ class TranslationService {
     required List<String> chunks,
     required String targetLanguage,
     required Function(int index, String translatedChunk) onChunkTranslated,
-    int batchSize = 5,
-    ////TODO add customizable number of batch t user configuration item 
+    required int batchSize,
+    ////TODO add customizable number of batch t user configuration item
   }) async {
     if (_client == null) {
       throw Exception('API Key not set before starting translation.');

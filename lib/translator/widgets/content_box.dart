@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 
-////TODO  create better box with some preset for rendering different formats and types 
 class ContentDisplayBox extends StatelessWidget {
   final String title;
   final String content;
@@ -27,7 +27,7 @@ class ContentDisplayBox extends StatelessWidget {
               width: double.infinity,
               child: Text(
                 title,
-                style: const TextStyle(
+                style: GoogleFonts.vazirmatn(
                   fontSize: 16,
                   fontWeight: FontWeight.bold,
                 ),
@@ -35,12 +35,12 @@ class ContentDisplayBox extends StatelessWidget {
             ),
             Expanded(
               child: Container(
-                color: Colors.grey.shade50,
+                // color: Colors.grey.shade50,
                 padding: const EdgeInsets.all(12),
                 child: SingleChildScrollView(
                   child: SelectableText(
                     content,
-                    style: const TextStyle(fontFamily: 'monospace'),
+                    style: GoogleFonts.vazirmatn(),
                   ),
                 ),
               ),

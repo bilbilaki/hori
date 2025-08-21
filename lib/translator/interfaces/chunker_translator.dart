@@ -1,4 +1,3 @@
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -6,13 +5,18 @@ import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:hori/main.dart';
 import 'package:hori/translator/configuration/config.dart';
+import 'package:hori/translator/interfaces/configuration_interface.dart';
 import 'package:hori/translator/services/text_chunker.dart';
 import 'package:hori/translator/services/text_translator.dart';
 import 'package:hori/translator/widgets/content_box.dart';
+import 'package:hori/translator/widgets/language_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
+import 'package:tiktoken/tiktoken.dart' as tk;
+
 class ChunkerInterfaceand extends StatefulWidget {
   const ChunkerInterfaceand({super.key});
 
@@ -44,19 +48,34 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
   final TextEditingController _overlapController = TextEditingController(
     text: '0',
   );
+  final TextEditingController _targetLanguageController = TextEditingController(
+    text: selectedDialogLanguage.name,
+  );
 
   // Translation State
-  final TextEditingController _apiKeyController = TextEditingController();
-  final TextEditingController _targetLanguageController = TextEditingController(
-    text: 'Spanish',
-  );
   final TranslationService _translationService = TranslationService();
+  late final tk.Tiktoken _enc;
   List<String> _chunks = [];
   List<String?>? _translatedChunks;
   bool _isTranslating = false;
   double _translationProgress = 0.0;
-////TODO implanting usage costs based on some presets and value user input for price of input and output to culculating of usage for each task .
-///TODO implanting service to get and Show user credits based on api (some prooviders support that, some of those not)
+
+  // Live token/cost and monitor
+  int _inputTokens = 0;
+  int _outputTokens = 0;
+  int _lastResultTokens = 0;
+  double _usageCost = 0.0; // $ per 1K tokens math
+  int _rpmThisMinute = 0;
+  int _tpmThisMinute = 0;
+  Timer? _minuteTimer;
+  bool _monitoring = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _enc = _encoderForModel(translatorConfig.modelId);
+  }
+
   @override
   void dispose() {
     _linesPerChunkController.dispose();
@@ -64,9 +83,30 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
     _charactersPerChunkController.dispose();
     _regexPatternController.dispose();
     _overlapController.dispose();
-    _apiKeyController.dispose();
     _targetLanguageController.dispose();
+    _minuteTimer?.cancel();
     super.dispose();
+  }
+
+  // Tokenizer helpers
+  tk.Tiktoken _encoderForModel(String modelId) {
+    final String enc =
+        (modelId.contains('gpt-4.1') ||
+            modelId.contains('gpt-4o') ||
+            modelId.contains('o1'))
+        ? 'o200k_base'
+        : 'cl100k_base';
+    return tk.getEncoding(enc);
+  }
+
+  int _countTokens(String text) => text.isEmpty ? 0 : _enc.encode(text).length;
+
+  void _recomputeUsageCost() {
+    final double inCost = translatorConfig.inputCost;
+    final double outCost = translatorConfig.outputCost;
+    _usageCost =
+        (_inputTokens / 1000000.0 * inCost) +
+        (_outputTokens / 1000000.0 * outCost);
   }
 
   Future<String> _extractTextFromPdfBytes(Uint8List bytes) async {
@@ -79,52 +119,68 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
       throw Exception('Failed to extract text from PDF: $e');
     }
   }
-////TODO  Implanting ai ocr to can support image and handwriting
-///TODO finding more smart method to can with less power in platform like android add files
+
   Future<void> _pickFile() async {
     try {
       final FilePickerResult? result = await FilePicker.platform.pickFiles(
         type: FileType.custom,
-        withData: true, // Ensure bytes are available for SAF on Android
+        allowedExtensions: ['txt', 'md', 'pdf'],
+        withData: false, // avoid loading large files into memory
         allowCompression: false,
       );
 
-      if (result != null && result.files.isNotEmpty) {
-        final PlatformFile platformFile = result.files.single;
-        _fileName = platformFile.name;
+      if (result == null || result.files.isEmpty) return;
 
-        String content = '';
-        final ext = (platformFile.extension ?? '').toLowerCase();
+      final PlatformFile pf = result.files.single;
+      _fileName = pf.name;
 
-        if (ext == 'pdf') {
-          if (platformFile.bytes != null) {
-            content = await _extractTextFromPdfBytes(platformFile.bytes!);
-          } else if (platformFile.path != null) {
-            final file = File(platformFile.path!);
-            final bytes = await file.readAsString();
-            content = bytes;
-          } else {
-            throw Exception('No readable data for selected PDF.');
+      String content = '';
+      final ext = (pf.extension ?? '').toLowerCase();
+
+      if (ext == 'pdf') {
+        if (pf.bytes != null) {
+          content = await _extractTextFromPdfBytes(pf.bytes!);
+        } else if (pf.readStream != null) {
+          // stream into bytes for PDF
+          final builder = BytesBuilder();
+          await for (final chunk in pf.readStream!) {
+            builder.add(chunk);
           }
+          content = await _extractTextFromPdfBytes(builder.takeBytes());
+        } else if (pf.path != null) {
+          final bytes = await File(pf.path!).readAsBytes();
+          content = await _extractTextFromPdfBytes(bytes);
         } else {
-          if (platformFile.path != null) {
-            content = await File(platformFile.path!).readAsString();
-          } else if (platformFile.bytes != null) {
-            content = utf8.decode(platformFile.bytes!, allowMalformed: true);
-          } else {
-            throw Exception('No readable data for selected text file.');
-          }
+          throw Exception('No readable data for selected PDF.');
         }
-
-        setState(() {
-          _originalFileContent = content;
-          _chunkedContent = 'Press "Chunk Text" to process.';
-          _translatedContent = 'Translate chunks to see the result.';
-          _chunks = [];
-          _translatedChunks = null;
-          _translationProgress = 0.0;
-        });
+      } else {
+        if (pf.path != null) {
+          // Prefer file path when available (fast and memory-safe)
+          content = await File(pf.path!).readAsString();
+        } else if (pf.readStream != null) {
+          // Stream-decode text safely for huge files
+          content = await pf.readStream!.transform(utf8.decoder).join();
+        } else if (pf.bytes != null) {
+          content = utf8.decode(pf.bytes!, allowMalformed: true);
+        } else {
+          throw Exception('No readable data for selected text file.');
+        }
       }
+
+      setState(() {
+        _originalFileContent = content;
+        _chunkedContent = 'Press "Chunk Text" to process.';
+        _translatedContent = 'Translate chunks to see the result.';
+        _chunks = [];
+        _translatedChunks = null;
+        _translationProgress = 0.0;
+
+        // Live update tokens from input immediately
+        _inputTokens = _countTokens(_originalFileContent);
+        _outputTokens = 0;
+        _lastResultTokens = 0;
+        _recomputeUsageCost();
+      });
     } catch (e) {
       _showSnack('Error picking or reading file: $e', error: true);
     }
@@ -154,26 +210,48 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
         _chunkedContent = _chunks
             .asMap()
             .entries
-            .map((entry) {
-              return '--- Chunk ${entry.key + 1} ---\n${entry.value}';
-            })
+            .map((e) => '--- Chunk ${e.key + 1} ---\n${e.value}')
             .join('\n\n');
         _translatedContent = 'Ready to translate ${_chunks.length} chunks.';
         _translatedChunks = null;
         _translationProgress = 0.0;
+
+        // Input tokens as sum over chunks for better accuracy
+        _inputTokens = _chunks.fold<int>(0, (sum, c) => sum + _countTokens(c));
+        _outputTokens = 0;
+        _lastResultTokens = 0;
+        _recomputeUsageCost();
       });
     } catch (e) {
       _showSnack('Error during chunking: $e', error: true);
     }
   }
 
-  Future<void> _performTranslation() async {
+  void _startMinuteMonitor() {
+    _minuteTimer?.cancel();
+    setState(() {
+      _rpmThisMinute = 0;
+      _tpmThisMinute = 0;
+      _monitoring = true;
+    });
+    _minuteTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+      setState(() {
+        _rpmThisMinute = 0;
+        _tpmThisMinute = 0;
+      });
+    });
+  }
+
+  void _stopMinuteMonitor() {
+    _minuteTimer?.cancel();
+    setState(() {
+      _monitoring = false; // keep last counters visible until next run
+    });
+  }
+
+ Future<void> _performTranslation() async {
     if (_chunks.isEmpty) {
       _showSnack('Please chunk the text before translating.', error: true);
-      return;
-    }
-    if (_apiKeyController.text.isEmpty) {
-      _showSnack('Please enter your OpenAI API Key.', error: true);
       return;
     }
 
@@ -184,20 +262,20 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
       _translatedContent = 'Translating...';
     });
 
-    _translationService.setApiKey(_apiKeyController.text);
-    int completedCount = 0;
-////TODO implant helper service to user can Set Some rate limit for each ai models and can save that value using shared prefs
+    _translationService.setApiKey();
+    _startMinuteMonitor();
+       int completedCount = 0;
     try {
       await _translationService.translateChunksConcurrently(
         chunks: _chunks,
-        targetLanguage: _targetLanguageController.text,
+        targetLanguage: translatorConfig.outputLang,
         onChunkTranslated: (index, translatedChunk) {
           setState(() {
             _translatedChunks![index] = translatedChunk;
             completedCount++;
             _translationProgress = completedCount / _chunks.length;
           });
-        },
+        }, batchSize: translatorConfig.batchN,
       );
     } catch (e) {
       _showSnack('Translation failed: $e', error: true);
@@ -217,51 +295,18 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
   }
 
   Future<bool> _ensureStoragePermission() async {
-    if (Platform.isAndroid == false) return true;
-
+    if (!Platform.isAndroid) return true;
     final status = await Permission.storage.request();
     if (status.isGranted || status.isLimited) return true;
-
     _showSnack(
       'Storage permission denied. Trying SAF-based save...',
       error: false,
     );
     return false;
-  }
-
-  Future<bool> saveStringToFile(String content) async {
-    try {
-      String? filePath = await FilePicker.platform.saveFile(
-        dialogTitle: 'Select where to save the .txt file',
-        fileName: 'my_documentTranslated.txt', 
-        type: FileType.custom,
-        allowedExtensions: ['txt'], 
-      );
-
-      if (filePath == null) {
-        debugPrint('File save operation cancelled by the user.');
-        return false;
-      }
-
-      if (!filePath.toLowerCase().endsWith('.txt')) {
-        filePath = '$filePath.txt';
-      }
-
-      final file = File(filePath);
-
-      await file.writeAsString(content);
-
-      debugPrint('File saved successfully to: $filePath');
-      return true;
-    } catch (e) {
-      debugPrint('Error saving file: $e');
-      // You might want to show a user-friendly error message here, e.g., using a SnackBar
-      return false;
-    }
+    // SAF saving handled by file_picker save dialog when permission is denied.
   }
 
   Future<void> _saveResult() async {
-    // Prioritize translated content, then chunked, then original.
     final String contentToSave =
         _translatedContent.isNotEmpty &&
             _translatedContent != 'Translated content will appear here.'
@@ -278,6 +323,7 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
         'No content to save. Please load a file and process it.',
         error: true,
       );
+      return;
     }
 
     final String? exportType = await showModalBottomSheet<String>(
@@ -294,29 +340,21 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
                 onTap: () async {
                   final String? dirPath = await FilePicker.platform
                       .getDirectoryPath();
-                  if (dirPath == null) {
-                    return;
-                  }
+                  if (dirPath == null) return;
                   final suggestedBase =
                       (_fileName?.replaceAll(RegExp(r'\.[^.]+$'), '') ??
                       'output');
-                  String fileName = suggestedBase;
-
                   final PdfDocument document = PdfDocument();
-                  // Add a PDF page and draw text.
                   document.pages.add().graphics.drawString(
                     contentToSave,
                     PdfStandardFont(PdfFontFamily.helvetica, 12),
                     brush: PdfSolidBrush(PdfColor(0, 0, 0)),
-                    bounds: const Rect.fromLTWH(0, 0, 150, 20),
+                    bounds: const Rect.fromLTWH(0, 0, 500, 800),
                   );
-                  // Save the document.
-                  File(
-                    '$dirPath/$fileName.pdf',
-                  ).writeAsBytes(await document.save());
-                  // Dispose the document.
+                  final pdfPath = p.join(dirPath, '$suggestedBase.pdf');
+                  File(pdfPath).writeAsBytes(await document.save());
                   document.dispose();
-                  Navigator.of(context).pop();
+                  if (mounted) Navigator.of(context).pop('pdf');
                 },
               ),
               ListTile(
@@ -325,20 +363,14 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
                 onTap: () async {
                   final String? dirPath = await FilePicker.platform
                       .getDirectoryPath();
-                  if (dirPath == null) {
-                    return;
-                  }
+                  if (dirPath == null) return;
                   final suggestedBase =
                       (_fileName?.replaceAll(RegExp(r'\.[^.]+$'), '') ??
                       'output');
-
-                  await _ensureStoragePermission(); // Proceed even if denied; SAF will handle.
-                  final csvFilePath = p.join(dirPath, '$suggestedBase.txt');
-
-                  await File(csvFilePath).writeAsString(contentToSave);
-
-                  //   saveStringToFile(contentToSave);
-                  Navigator.of(context).pop();
+                  await _ensureStoragePermission();
+                  final txtPath = p.join(dirPath, '$suggestedBase.txt');
+                  await File(txtPath).writeAsString(contentToSave);
+                  if (mounted) Navigator.of(context).pop('txt');
                 },
               ),
               const SizedBox(height: 12),
@@ -361,355 +393,344 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
     );
   }
 
+  Widget _monitorBar() {
+    final styleLabel = Theme.of(context).textTheme.labelSmall;
+    final styleValue = Theme.of(context).textTheme.labelSmall?.copyWith(
+      fontFeatures: const [FontFeature.tabularFigures()],
+    );
+
+    Widget chip(String label, String value, {IconData? icon}) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        margin: const EdgeInsets.symmetric(horizontal: 4),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.06),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.white10),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (icon != null) ...[
+              Icon(icon, size: 14, color: Colors.tealAccent),
+              const SizedBox(width: 6),
+            ],
+            Text('$label ', style: styleLabel),
+            Text(value, style: styleValue),
+          ],
+        ),
+      );
+    }
+
+    return Wrap(
+      spacing: 4,
+      runSpacing: -6,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        chip('Input tok', '$_inputTokens', icon: Icons.input),
+        chip('Output tok', '$_outputTokens', icon: Icons.outbond),
+        chip('Last result tok', '$_lastResultTokens', icon: Icons.history),
+        chip('Usage', _usageCost.toStringAsFixed(4), icon: Icons.payments),
+        chip('RPM (min)', '$_rpmThisMinute', icon: Icons.av_timer),
+        chip('TPM (min)', '$_tpmThisMinute', icon: Icons.speed),
+        chip(
+          'Status',
+          _monitoring ? 'monitoring' : 'idle',
+          icon: _monitoring ? Icons.play_arrow : Icons.pause,
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final controls = Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        children: <Widget>[
+          // Top row: File and Config button
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: _pickFile,
+                  icon: const Icon(Icons.folder_open),
+                  label: const Text('Select File'),
+                  style: const ButtonStyle(
+                    minimumSize: WidgetStatePropertyAll(Size.fromHeight(48)),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              FilledButton.tonalIcon(
+                onPressed: () => Navigator.of(
+                  context,
+                ).push(MaterialPageRoute(builder: (_) => const ConfigPage())),
+                icon: const Icon(Icons.settings),
+                label: const Text('Open Config'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              _fileName ?? 'No file selected',
+              overflow: TextOverflow.ellipsis,
+              maxLines: 2,
+            ),
+          ),
+          const SizedBox(height: 12),
+
+
+          ElevatedButton(
+            child: Text('Target Language ${translatorConfig.outputLang}'),
+            onPressed: () {
+              openLanguagePickerDialog(context);
+              setState(() {
+                
+              });
+            },
+          ),
+          const SizedBox(height: 12),
+          const Divider(height: 24),
+
+          // Chunking options
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              children: ChunkingMethod.values.map((method) {
+                return ChoiceChip(
+                  label: Text(
+                    method.name[0].toUpperCase() + method.name.substring(1),
+                  ),
+                  selected: _selectedChunkingMethod == method,
+                  onSelected: (selected) =>
+                      setState(() => _selectedChunkingMethod = method),
+                );
+              }).toList(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          _buildChunkingInputs(),
+          const SizedBox(height: 16),
+
+          // Actions
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: _performChunking,
+                  icon: const Icon(Icons.cut),
+                  label: const Text('Chunk Text'),
+                  style: const ButtonStyle(
+                    minimumSize: WidgetStatePropertyAll(Size.fromHeight(48)),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: _isTranslating ? null : _performTranslation,
+                  icon: const Icon(Icons.translate),
+                  label: const Text('Translate Chunks'),
+                  style: ButtonStyle(
+                    backgroundColor: WidgetStateProperty.resolveWith((states) {
+                      if (states.contains(WidgetState.disabled))
+                        return Colors.grey.shade600;
+                      return Colors.green.shade600;
+                    }),
+                    foregroundColor: const WidgetStatePropertyAll(Colors.white),
+                    minimumSize: const WidgetStatePropertyAll(
+                      Size.fromHeight(48),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: _saveResult,
+                  icon: const Icon(Icons.save),
+                  label: const Text('Save Result'),
+                  style: ButtonStyle(
+                    backgroundColor: WidgetStatePropertyAll(
+                      Colors.blue.shade600,
+                    ),
+                    foregroundColor: const WidgetStatePropertyAll(Colors.white),
+                    minimumSize: const WidgetStatePropertyAll(
+                      Size.fromHeight(48),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (_isTranslating)
+            Padding(
+              padding: const EdgeInsets.only(top: 12.0),
+              child: Column(
+                children: [
+                  LinearProgressIndicator(value: _translationProgress),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Translating... ${(_translationProgress * 100).toStringAsFixed(0)}%',
+                  ),
+                ],
+              ),
+            ),
+
+          const SizedBox(height: 10),
+          _monitorBar(),
+        ],
+      ),
+    );
+
+    final contentTabs = DefaultTabController(
+      length: 3,
+      child: Column(
+        children: [
+          const TabBar(
+            tabs: [
+              Tab(icon: Icon(Icons.description), text: 'Original'),
+              Tab(icon: Icon(Icons.segment), text: 'Chunked'),
+              Tab(icon: Icon(Icons.translate), text: 'Translated'),
+            ],
+          ),
+          Expanded(
+            child: TabBarView(
+              children: [
+                ContentDisplayBox(
+                  title: 'Original Content',
+                  content: _originalFileContent,
+                ),
+                ContentDisplayBox(
+                  title: 'Chunked Content (${_chunks.length} chunks)',
+                  content: _chunkedContent,
+                ),
+                ContentDisplayBox(
+                  title: 'Translated Content',
+                  content: _translatedContent,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+
     return MaterialApp(
-      title: 'Flutter File Chunker & Translator',
+      title: 'File Chunker & Translator',
       theme: ThemeData(
-        useMaterial3: true,
-        colorSchemeSeed: Colors.indigo,
+        primarySwatch: Colors.blueGrey,
+        brightness: Brightness.dark, // Awesome style often includes dark theme
         visualDensity: VisualDensity.adaptivePlatformDensity,
-        inputDecorationTheme: const InputDecorationTheme(
-          border: OutlineInputBorder(),
-          contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        appBarTheme: const AppBarTheme(
+          elevation: 0,
+          centerTitle: true,
+          backgroundColor: Colors.black12,
+        ),
+        scaffoldBackgroundColor: Colors.black87,
+        cardColor: Colors.black26, // For cards/sections
+        textTheme: Theme.of(context).textTheme.apply(
+          bodyColor: Colors.white70,
+          displayColor: Colors.white,
+        ),
+        inputDecorationTheme: InputDecorationTheme(
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(12),
+            borderSide: BorderSide.none,
+          ),
+          filled: true,
+          fillColor: Colors.white.withOpacity(0.08),
+          hintStyle: TextStyle(color: Colors.white30),
+          labelStyle: TextStyle(color: Colors.white70),
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 16,
+            vertical: 12,
+          ),
+        ),
+        switchTheme: SwitchThemeData(
+          thumbColor: MaterialStateProperty.resolveWith((states) {
+            if (states.contains(MaterialState.selected)) {
+              return Colors.tealAccent;
+            }
+            return Colors.grey[600];
+          }),
+          trackColor: MaterialStateProperty.resolveWith((states) {
+            if (states.contains(MaterialState.selected)) {
+              return Colors.tealAccent.withOpacity(0.5);
+            }
+            return Colors.grey[700];
+          }),
+        ),
+        sliderTheme: SliderThemeData(
+          trackHeight: 4,
+          activeTrackColor: Colors.tealAccent,
+          inactiveTrackColor: Colors.white.withOpacity(0.3),
+          thumbColor: Colors.tealAccent,
+          overlayColor: Colors.tealAccent.withOpacity(0.2),
+          valueIndicatorColor: Colors.tealAccent,
+          valueIndicatorTextStyle: TextStyle(color: Colors.black),
+          showValueIndicator: ShowValueIndicator.always,
+        ),
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: Colors.teal, // Button background color
+            foregroundColor: Colors.white, // Button text color
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+            ),
+            textStyle: const TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
         ),
       ),
-      home: DefaultTabController(
-        length: 3,
-        child: Builder(
-          builder: (ctx) {
-            return Scaffold(
-              appBar: AppBar(
-                title: const Text('File Chunker & Translator'),
-                centerTitle: true,
-                bottom: const TabBar(
-                  tabs: [
-                    Tab(icon: Icon(Icons.description), text: 'Original'),
-                    Tab(icon: Icon(Icons.segment), text: 'Chunked'),
-                    Tab(icon: Icon(Icons.translate), text: 'Translated'),
-                  ],
-                ),
-              ),
-              body: SafeArea(
-                child: LayoutBuilder(
-                  builder: (context, constraints) {
-                    final isWide = constraints.maxWidth >= 900;
-                    final controls = Padding(
-                      padding: const EdgeInsets.all(16.0),
-                      child: Column(
-                        children: <Widget>[
-                          // Controls
-                          isWide
-                              ? Row(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Expanded(
-                                      flex: 2,
-                                      child: Column(
-                                        children: [
-                                          FilledButton.icon(
-                                            onPressed: _pickFile,
-                                            icon: const Icon(Icons.folder_open),
-                                            label: const Text('Select File'),
-                                            style: const ButtonStyle(
-                                              minimumSize:
-                                                  WidgetStatePropertyAll(
-                                                    Size.fromHeight(48),
-                                                  ),
-                                            ),
-                                          ),
-                                          const SizedBox(height: 8),
-                                          Text(
-                                            _fileName ?? 'No file selected',
-                                            textAlign: TextAlign.center,
-                                            overflow: TextOverflow.ellipsis,
-                                            maxLines: 2,
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                    const SizedBox(width: 16),
-                                    Expanded(
-                                      flex: 3,
-                                      child: Column(
-                                        children: [
-                                          TextField(
-                                            controller: _apiKeyController,
-                                            decoration: const InputDecoration(
-                                              labelText: 'OpenAI API Key',
-                                              prefixIcon: Icon(Icons.vpn_key),
-                                            ),
-                                            obscureText: true,
-                                          ),
-                                          const SizedBox(height: 8),
-                                          TextField(
-                                            controller:
-                                                _targetLanguageController,
-                                            decoration: const InputDecoration(
-                                              labelText: 'Target Language',
-                                              prefixIcon: Icon(Icons.language),
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  ],
-                                )
-                              : Column(
-                                  children: [
-                                    FilledButton.icon(
-                                      onPressed: _pickFile,
-                                      icon: const Icon(Icons.folder_open),
-                                      label: const Text('Select File'),
-                                      style: const ButtonStyle(
-                                        minimumSize: WidgetStatePropertyAll(
-                                          Size.fromHeight(48),
-                                        ),
-                                      ),
-                                    ),
-                                    const SizedBox(height: 8),
-                                    Align(
-                                      alignment: Alignment.centerLeft,
-                                      child: Text(
-                                        _fileName ?? 'No file selected',
-                                        overflow: TextOverflow.ellipsis,
-                                        maxLines: 2,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 12),
-                                    TextField(
-                                      controller: _apiKeyController,
-                                      decoration: const InputDecoration(
-                                        labelText: 'OpenAI API Key',
-                                        prefixIcon: Icon(Icons.vpn_key),
-                                      ),
-                                      obscureText: true,
-                                    ),
-                                    const SizedBox(height: 8),
-                                    TextField(
-                                      controller: _targetLanguageController,
-                                      decoration: const InputDecoration(
-                                        labelText: 'Target Language',
-                                        prefixIcon: Icon(Icons.language),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                          const SizedBox(height: 12),
-                          const Divider(height: 24),
-                          // Chunking Options
-                          isWide
-                              ? Row(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Expanded(
-                                      child: Column(
-                                        crossAxisAlignment:
-                                            CrossAxisAlignment.start,
-                                        children: [
-                                          const Text(
-                                            'Chunking Method:',
-                                            style: TextStyle(
-                                              fontWeight: FontWeight.bold,
-                                            ),
-                                          ),
-                                          const SizedBox(height: 6),
-                                          Wrap(
-                                            spacing: 8.0,
-                                            runSpacing: 6.0,
-                                            children: ChunkingMethod.values.map((
-                                              method,
-                                            ) {
-                                              return ChoiceChip(
-                                                label: Text(
-                                                  method.name[0].toUpperCase() +
-                                                      method.name.substring(1),
-                                                ),
-                                                selected:
-                                                    _selectedChunkingMethod ==
-                                                    method,
-                                                onSelected: (selected) {
-                                                  if (selected) {
-                                                    setState(
-                                                      () =>
-                                                          _selectedChunkingMethod =
-                                                              method,
-                                                    );
-                                                  }
-                                                },
-                                              );
-                                            }).toList(),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                    const SizedBox(width: 16),
-                                    Expanded(child: _buildChunkingInputs()),
-                                  ],
-                                )
-                              : Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    const Text(
-                                      'Chunking Method:',
-                                      style: TextStyle(
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 6),
-                                    Wrap(
-                                      spacing: 8.0,
-                                      runSpacing: 6.0,
-                                      children: ChunkingMethod.values.map((
-                                        method,
-                                      ) {
-                                        return ChoiceChip(
-                                          label: Text(
-                                            method.name[0].toUpperCase() +
-                                                method.name.substring(1),
-                                          ),
-                                          selected:
-                                              _selectedChunkingMethod == method,
-                                          onSelected: (selected) {
-                                            if (selected) {
-                                              setState(
-                                                () => _selectedChunkingMethod =
-                                                    method,
-                                              );
-                                            }
-                                          },
-                                        );
-                                      }).toList(),
-                                    ),
-                                    const SizedBox(height: 12),
-                                    _buildChunkingInputs(),
-                                  ],
-                                ),
-                          const SizedBox(height: 16),
-                          // Actions
-                          Row(
-                            children: [
-                              Expanded(
-                                child: FilledButton.icon(
-                                  onPressed: _performChunking,
-                                  icon: const Icon(Icons.cut),
-                                  label: const Text('Chunk Text'),
-                                  style: const ButtonStyle(
-                                    minimumSize: WidgetStatePropertyAll(
-                                      Size.fromHeight(48),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: FilledButton.icon(
-                                  onPressed: _isTranslating
-                                      ? null
-                                      : _performTranslation,
-                                  icon: const Icon(Icons.translate),
-                                  label: const Text('Translate Chunks'),
-                                  style: ButtonStyle(
-                                    backgroundColor:
-                                        WidgetStateProperty.resolveWith((
-                                          states,
-                                        ) {
-                                          if (states.contains(
-                                            WidgetState.disabled,
-                                          )) {
-                                            return Colors.grey.shade400;
-                                          }
-                                          return Colors.green.shade600;
-                                        }),
-                                    foregroundColor:
-                                        const WidgetStatePropertyAll(
-                                          Colors.white,
-                                        ),
-                                    minimumSize: const WidgetStatePropertyAll(
-                                      Size.fromHeight(48),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: FilledButton.icon(
-                                  onPressed: _saveResult,
-                                  icon: const Icon(Icons.save),
-                                  label: const Text('Save Result'),
-                                  style: ButtonStyle(
-                                    backgroundColor: WidgetStatePropertyAll(
-                                      Colors.blue.shade600,
-                                    ),
-                                    foregroundColor:
-                                        const WidgetStatePropertyAll(
-                                          Colors.white,
-                                        ),
-                                    minimumSize: const WidgetStatePropertyAll(
-                                      Size.fromHeight(48),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
+      home: Scaffold(
+        appBar: AppBar(
+          title: const Text('File Chunker & Translator'),
+          centerTitle: true,
+          actions: [
+            IconButton(
+              tooltip: 'Configuration',
+              onPressed: () => Navigator.of(
+                context,
+              ).push(MaterialPageRoute(builder: (_) => const ConfigPage())),
+              icon: const Icon(Icons.settings),
+            ),
+          ],
+        ),
+        body: SafeArea(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final isWide = constraints.maxWidth >= 900;
+              return Column(
+                children: [
+                  Expanded(
+                    flex: 2,
+                    child: SingleChildScrollView(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 1200),
+                        child: Padding(
+                          padding: EdgeInsets.symmetric(
+                            horizontal: isWide ? 24 : 8,
                           ),
-                          if (_isTranslating)
-                            Padding(
-                              padding: const EdgeInsets.only(top: 12.0),
-                              child: Column(
-                                children: [
-                                  LinearProgressIndicator(
-                                    value: _translationProgress,
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    'Translating... ${(_translationProgress * 100).toStringAsFixed(0)}%',
-                                  ),
-                                ],
-                              ),
-                            ),
-                        ],
+                          child: controls,
+                        ),
                       ),
-                    );
-
-                    final contentTabs = TabBarView(
-                      children: [
-                        ContentDisplayBox(
-                          title: 'Original Content',
-                          content: _originalFileContent,
-                        ),
-                        ContentDisplayBox(
-                          title: 'Chunked Content (${_chunks.length} chunks)',
-                          content: _chunkedContent,
-                        ),
-                        ContentDisplayBox(
-                          title: 'Translated Content',
-                          content: _translatedContent,
-                        ),
-                      ],
-                    );
-
-                    return Column(
-                      children: [
-                        // 1. Give the controls a flexible portion of the screen
-                        Expanded(
-                          flex: 2, // You can adjust this value
-                          // 2. Make the controls scrollable if they are too big for their space
-                          child: SingleChildScrollView(child: controls),
-                        ),
-                        const Divider(height: 0),
-                        // 3. Give the content tabs the remaining portion of the screen
-                        Expanded(
-                          flex: 3, // You can adjust this value
-                          child: contentTabs,
-                        ),
-                      ],
-                    );
-                  },
-                ),
-              ),
-            );
-          },
+                    ),
+                  ),
+                  const Divider(height: 0),
+                  Expanded(flex: 2, child: contentTabs),
+                ],
+              );
+            },
+          ),
         ),
       ),
     );
@@ -767,5 +788,3 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
     );
   }
 }
-
-/// Enum to define different chunking methods for text.
