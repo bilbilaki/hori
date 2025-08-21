@@ -338,23 +338,39 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
                 leading: const Icon(Icons.picture_as_pdf),
                 title: const Text('Export as PDF'),
                 onTap: () async {
-                  final String? dirPath = await FilePicker.platform
-                      .getDirectoryPath();
-                  if (dirPath == null) return;
-                  final suggestedBase =
-                      (_fileName?.replaceAll(RegExp(r'\.[^.]+$'), '') ??
-                      'output');
-                  final PdfDocument document = PdfDocument();
-                  document.pages.add().graphics.drawString(
-                    contentToSave,
-                    PdfStandardFont(PdfFontFamily.helvetica, 12),
-                    brush: PdfSolidBrush(PdfColor(0, 0, 0)),
-                    bounds: const Rect.fromLTWH(0, 0, 500, 800),
-                  );
-                  final pdfPath = p.join(dirPath, '$suggestedBase.pdf');
-                  File(pdfPath).writeAsBytes(await document.save());
-                  document.dispose();
-                  if (mounted) Navigator.of(context).pop('pdf');
+                 // ... inside the 'Export as PDF' ListTile onTap callback
+final String? dirPath = await FilePicker.platform.getDirectoryPath();
+if (dirPath == null) return;
+final suggestedBase = (_fileName?.replaceAll(RegExp(r'\.[^.]+$'), '') ?? 'output');
+final pdfPath = p.join(dirPath, '$suggestedBase.pdf');
+
+final PdfDocument document = PdfDocument();
+final PdfPage page = document.pages.add();
+
+// Use PdfTextElement for proper text wrapping and pagination
+final PdfTextElement textElement = PdfTextElement(
+  text: contentToSave,
+  font: PdfStandardFont(PdfFontFamily.helvetica, 12),
+  brush: PdfSolidBrush(PdfColor(0, 0, 0)),
+);
+
+// Use a layout format that automatically paginates
+final PdfLayoutFormat layoutFormat = PdfLayoutFormat(
+  layoutType: PdfLayoutType.paginate,
+);
+
+// Draw the text element on the page
+textElement.draw(
+  page: page,
+  bounds: Rect.fromLTWH(0, 0, page.getClientSize().width, page.getClientSize().height),
+  format: layoutFormat,
+);
+
+// Save the document to the file
+File(pdfPath).writeAsBytes(await document.save());
+document.dispose();
+
+if (mounted) Navigator.of(context).pop('pdf');
                 },
               ),
               ListTile(
