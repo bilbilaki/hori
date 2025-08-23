@@ -33,13 +33,15 @@ class TranslatorConfigAdapter extends TypeAdapter<TranslatorConfig> {
       ..outputFormat = fields[13] as String
       ..modelId = fields[14] as String
       ..systemPrompt = fields[15] as String
-      ..temp = fields[16] as double;
+      ..temp = fields[16] as double
+      ..geminiApi = fields[17] as String
+      ..geminiPrompt = fields[18] as String;
   }
 
   @override
   void write(BinaryWriter writer, TranslatorConfig obj) {
     writer
-      ..writeByte(17)
+      ..writeByte(19)
       ..writeByte(0)
       ..write(obj.apiKey)
       ..writeByte(1)
@@ -73,7 +75,11 @@ class TranslatorConfigAdapter extends TypeAdapter<TranslatorConfig> {
       ..writeByte(15)
       ..write(obj.systemPrompt)
       ..writeByte(16)
-      ..write(obj.temp);
+      ..write(obj.temp)
+      ..writeByte(17)
+      ..write(obj.geminiApi)
+      ..writeByte(18)
+      ..write(obj.geminiPrompt);
   }
 
   @override

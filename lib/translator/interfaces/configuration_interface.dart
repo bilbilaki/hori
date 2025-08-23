@@ -12,6 +12,7 @@ class ConfigPage extends StatefulWidget {
 
 class _ConfigPageState extends State<ConfigPage> {
   late final TextEditingController _apiKey;
+  late final TextEditingController _geminiApiKey;
   late final TextEditingController _baseUrl;
   late final TextEditingController _rateLimitReq;
   late final TextEditingController _rateLimitToken;
@@ -24,6 +25,7 @@ class _ConfigPageState extends State<ConfigPage> {
   late final TextEditingController _outputFormat;
   late final TextEditingController _modelId;
   late final TextEditingController _systemPrompt;
+  late final TextEditingController _geminiPrompt;
   late bool _autoDetectInput;
   late double _temp;
 
@@ -31,6 +33,7 @@ class _ConfigPageState extends State<ConfigPage> {
   void initState() {
     super.initState();
     _apiKey = TextEditingController(text: translatorConfig.apiKey);
+    _geminiApiKey = TextEditingController(text: translatorConfig.geminiApi);
     _baseUrl = TextEditingController(text: translatorConfig.baseUrl);
     _rateLimitReq = TextEditingController(
       text: translatorConfig.rateLimitReq.toString(),
@@ -51,6 +54,7 @@ class _ConfigPageState extends State<ConfigPage> {
     _outputFormat = TextEditingController(text: translatorConfig.outputFormat);
     _modelId = TextEditingController(text: translatorConfig.modelId);
     _systemPrompt = TextEditingController(text: translatorConfig.systemPrompt);
+    _geminiPrompt = TextEditingController(text: translatorConfig.geminiPrompt);
     _autoDetectInput = translatorConfig.autoDetectInput;
     _temp = translatorConfig.temp;
   }
@@ -58,6 +62,7 @@ class _ConfigPageState extends State<ConfigPage> {
   @override
   void dispose() {
     _apiKey.dispose();
+    _geminiApiKey.dispose();
     _baseUrl.dispose();
     _rateLimitReq.dispose();
     _rateLimitToken.dispose();
@@ -70,6 +75,7 @@ class _ConfigPageState extends State<ConfigPage> {
     _outputFormat.dispose();
     _modelId.dispose();
     _systemPrompt.dispose();
+    _geminiPrompt.dispose();
     super.dispose();
   }
 
@@ -77,6 +83,7 @@ class _ConfigPageState extends State<ConfigPage> {
     try {
       translatorConfig
         ..apiKey = _apiKey.text
+        ..geminiApi = _geminiApiKey.text
         ..baseUrl = _baseUrl.text
         ..rateLimitReq =
             int.tryParse(_rateLimitReq.text) ?? translatorConfig.rateLimitReq
@@ -95,6 +102,8 @@ class _ConfigPageState extends State<ConfigPage> {
         ..outputFormat = _outputFormat.text
         ..modelId = _modelId.text
         ..systemPrompt = _systemPrompt.text
+                ..geminiPrompt = _geminiPrompt.text
+
         ..temp = _temp;
 
       final box = Hive.box<TranslatorConfig>('app_config');
@@ -146,6 +155,11 @@ class _ConfigPageState extends State<ConfigPage> {
           children: [
             const Text('API', style: TextStyle(fontWeight: FontWeight.bold)),
             _field(_apiKey, 'API Key', kt: TextInputType.visiblePassword),
+            _field(
+              _geminiApiKey,
+              'Gemini API Key',
+              kt: TextInputType.visiblePassword,
+            ),
             _field(_baseUrl, 'Base URL'),
             const SizedBox(height: 10),
             const Text(
@@ -229,7 +243,7 @@ class _ConfigPageState extends State<ConfigPage> {
             ),
             ListTile(
               contentPadding: EdgeInsets.zero,
-              title:  Text('Temperature : ${translatorConfig.temp}'),
+              title: Text('Temperature : ${translatorConfig.temp}'),
               subtitle: Slider(
                 value: _temp,
                 min: 0,
@@ -240,6 +254,7 @@ class _ConfigPageState extends State<ConfigPage> {
               ),
             ),
             _field(_systemPrompt, 'System Prompt', maxLines: 8),
+                        _field(_geminiPrompt, 'Gemini Ocr Prompt', maxLines: 8),
             const SizedBox(height: 80),
           ],
         ),

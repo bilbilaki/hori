@@ -4,7 +4,6 @@ import 'package:openai_dart/openai_dart.dart';
 /// Service for handling translation via OpenAI API.
 class TranslationService {
   OpenAIClient? _client;
-  ////TODO Creating field with default value openai.com and complete customizable by user with shared prefs too can save value
   void setApiKey() {
     _client = OpenAIClient(
       apiKey: translatorConfig.apiKey,
@@ -51,7 +50,6 @@ class TranslationService {
     required String targetLanguage,
     required Function(int index, String translatedChunk) onChunkTranslated,
     required int batchSize,
-    ////TODO add customizable number of batch t user configuration item
   }) async {
     if (_client == null) {
       throw Exception('API Key not set before starting translation.');

@@ -8,14 +8,43 @@ import 'package:flutter/material.dart';
 import 'package:hori/main.dart';
 import 'package:hori/translator/configuration/config.dart';
 import 'package:hori/translator/interfaces/configuration_interface.dart';
+import 'package:hori/translator/services/ocr.dart';
 import 'package:hori/translator/services/text_chunker.dart';
 import 'package:hori/translator/services/text_translator.dart';
+import 'package:hori/translator/utils/colors.dart';
 import 'package:hori/translator/widgets/content_box.dart';
 import 'package:hori/translator/widgets/language_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
 import 'package:tiktoken/tiktoken.dart' as tk;
+import 'package:docx_to_text/docx_to_text.dart';
+
+part '../widgets/chunking_input.dart';
+
+// UI and Chunking Parameters
+ChunkingMethod selectedChunkingMethod = ChunkingMethod.lines;
+final TextEditingController linesPerChunkController = TextEditingController(
+  text: '10',
+);
+final TextEditingController wordsPerChunkController = TextEditingController(
+  text: '100',
+);
+final TextEditingController charactersPerChunkController =
+    TextEditingController(text: '1000');
+final TextEditingController regexPatternController = TextEditingController(
+  text: r'\n\n+',
+);
+final TextEditingController overlapController = TextEditingController(
+  text: '0',
+);
+final TextEditingController targetLanguageController = TextEditingController(
+  text: selectedDialogLanguage.name,
+);
+
+// Translation State
+
+// Live token/cost and monitor
 
 class ChunkerInterfaceand extends StatefulWidget {
   const ChunkerInterfaceand({super.key});
@@ -26,70 +55,51 @@ class ChunkerInterfaceand extends StatefulWidget {
 
 class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
   // File and Content State
-  String? _fileName;
-  String _originalFileContent =
+
+  final TranslationService translationService = TranslationService();
+  late final tk.Tiktoken enc;
+  List<String> chunks = [];
+  List<String?>? translatedChunks;
+  bool isTranslating = false;
+  double translationProgress = 0.0;
+  String? fileName;
+  String originalFileContent =
       'Select a text file to display its content here.';
-  String _chunkedContent = 'Chunked content will appear here after processing.';
-  String _translatedContent = 'Translated content will appear here.';
-
-  // UI and Chunking Parameters
-  ChunkingMethod _selectedChunkingMethod = ChunkingMethod.lines;
-  final TextEditingController _linesPerChunkController = TextEditingController(
-    text: '10',
-  );
-  final TextEditingController _wordsPerChunkController = TextEditingController(
-    text: '100',
-  );
-  final TextEditingController _charactersPerChunkController =
-      TextEditingController(text: '1000');
-  final TextEditingController _regexPatternController = TextEditingController(
-    text: r'\n\n+',
-  );
-  final TextEditingController _overlapController = TextEditingController(
-    text: '0',
-  );
-  final TextEditingController _targetLanguageController = TextEditingController(
-    text: selectedDialogLanguage.name,
-  );
-
-  // Translation State
-  final TranslationService _translationService = TranslationService();
-  late final tk.Tiktoken _enc;
-  List<String> _chunks = [];
-  List<String?>? _translatedChunks;
-  bool _isTranslating = false;
-  double _translationProgress = 0.0;
-
-  // Live token/cost and monitor
-  int _inputTokens = 0;
-  int _outputTokens = 0;
-  int _lastResultTokens = 0;
-  double _usageCost = 0.0; // $ per 1K tokens math
-  int _rpmThisMinute = 0;
-  int _tpmThisMinute = 0;
-  Timer? _minuteTimer;
-  bool _monitoring = false;
-
+  String chunkedContent = 'Chunked content will appear here after processing.';
+  String translatedContent = 'Translated content will appear here.';
+  int inputTokens = 0;
+  int outputTokens = 0;
+  int lastResultTokens = 0;
+  double usageCost = 0.0; // $ per 1K tokens math
+  int rpmThisMinute = 0;
+  int tpmThisMinute = 0;
+  Timer? minuteTimer;
+  bool monitoring = false;
+  bool ocr = false;
+    final GeminiOcrService _ocrService = GeminiOcrService();
+  bool isOcrEnabled = false; // The state for the OCR checkbox
+  List<PlatformFile> selectedFilesForOcr = [];
+  bool isOcrProcessing = false;
+  double ocrProgress = 0.0;
   @override
   void initState() {
     super.initState();
-    _enc = _encoderForModel(translatorConfig.modelId);
+    enc = encoderForModel(translatorConfig.modelId);
   }
 
   @override
   void dispose() {
-    _linesPerChunkController.dispose();
-    _wordsPerChunkController.dispose();
-    _charactersPerChunkController.dispose();
-    _regexPatternController.dispose();
-    _overlapController.dispose();
-    _targetLanguageController.dispose();
-    _minuteTimer?.cancel();
+   linesPerChunkController.dispose();
+    wordsPerChunkController.dispose();
+    charactersPerChunkController.dispose();
+    regexPatternController.dispose();
+    overlapController.dispose();
+    targetLanguageController.dispose();
+    minuteTimer?.cancel();
     super.dispose();
   }
 
-  // Tokenizer helpers
-  tk.Tiktoken _encoderForModel(String modelId) {
+  tk.Tiktoken encoderForModel(String modelId) {
     final String enc =
         (modelId.contains('gpt-4.1') ||
             modelId.contains('gpt-4o') ||
@@ -99,17 +109,17 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
     return tk.getEncoding(enc);
   }
 
-  int _countTokens(String text) => text.isEmpty ? 0 : _enc.encode(text).length;
+  int _countTokens(String text) => text.isEmpty ? 0 : enc.encode(text).length;
 
   void _recomputeUsageCost() {
     final double inCost = translatorConfig.inputCost;
     final double outCost = translatorConfig.outputCost;
-    _usageCost =
-        (_inputTokens / 1000000.0 * inCost) +
-        (_outputTokens / 1000000.0 * outCost);
+    usageCost =
+        (inputTokens / 1000000.0 * inCost) +
+        (outputTokens / 1000000.0 * outCost);
   }
 
-  Future<String> _extractTextFromPdfBytes(Uint8List bytes) async {
+  Future<String> extractTextFromPdfBytes(Uint8List bytes) async {
     try {
       final PdfDocument document = PdfDocument(inputBytes: bytes);
       final String text = PdfTextExtractor(document).extractText();
@@ -120,40 +130,57 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
     }
   }
 
-  Future<void> _pickFile() async {
+  void showSnack(String message, {bool error = false}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: error ? Colors.red.shade700 : Colors.green.shade600,
+        duration: const Duration(seconds: 4),
+      ),
+    );
+  }
+
+  Future<void> pickFile(result) async {
     try {
-      final FilePickerResult? result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['txt', 'md', 'pdf'],
-        withData: false, // avoid loading large files into memory
-        allowCompression: false,
-      );
-
-      if (result == null || result.files.isEmpty) return;
-
-      final PlatformFile pf = result.files.single;
-      _fileName = pf.name;
+      PlatformFile pf = result.files.single;
+      fileName = pf.name;
 
       String content = '';
       final ext = (pf.extension ?? '').toLowerCase();
 
-      if (ext == 'pdf') {
+      if (ext == 'pdf' && ocr == false) {
         if (pf.bytes != null) {
-          content = await _extractTextFromPdfBytes(pf.bytes!);
+          content = await extractTextFromPdfBytes(pf.bytes!);
         } else if (pf.readStream != null) {
           // stream into bytes for PDF
           final builder = BytesBuilder();
           await for (final chunk in pf.readStream!) {
             builder.add(chunk);
           }
-          content = await _extractTextFromPdfBytes(builder.takeBytes());
+          content = await extractTextFromPdfBytes(builder.takeBytes());
         } else if (pf.path != null) {
           final bytes = await File(pf.path!).readAsBytes();
-          content = await _extractTextFromPdfBytes(bytes);
+          content = await extractTextFromPdfBytes(bytes);
         } else {
           throw Exception('No readable data for selected PDF.');
         }
-      } else {
+      } else if (ext == 'doc' || ext == 'docx') {
+        if (pf.bytes != null) {
+          content = docxToText(pf.bytes!);
+        } else if (pf.readStream != null) {
+          // stream into bytes for PDF
+          final builder = BytesBuilder();
+          await for (final chunk in pf.readStream!) {
+            builder.add(chunk);
+          }
+          content = docxToText(builder.takeBytes());
+        } else if (pf.path != null) {
+          final bytes = await File(pf.path!).readAsBytes();
+          content = docxToText(bytes);
+        } else {
+          throw Exception('No readable data for selected Doc or Docx.');
+        }
+      }  else {
         if (pf.path != null) {
           // Prefer file path when available (fast and memory-safe)
           content = await File(pf.path!).readAsString();
@@ -166,128 +193,189 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
           throw Exception('No readable data for selected text file.');
         }
       }
-
       setState(() {
-        _originalFileContent = content;
-        _chunkedContent = 'Press "Chunk Text" to process.';
-        _translatedContent = 'Translate chunks to see the result.';
-        _chunks = [];
-        _translatedChunks = null;
-        _translationProgress = 0.0;
+        originalFileContent = content;
+        chunkedContent = 'Press "Chunk Text" to process.';
+        translatedContent = 'Translate chunks to see the result.';
+        chunks = [];
+        translatedChunks = null;
+        translationProgress = 0.0;
 
         // Live update tokens from input immediately
-        _inputTokens = _countTokens(_originalFileContent);
-        _outputTokens = 0;
-        _lastResultTokens = 0;
+        inputTokens = _countTokens(originalFileContent);
+        outputTokens = 0;
+        lastResultTokens = 0;
         _recomputeUsageCost();
       });
     } catch (e) {
-      _showSnack('Error picking or reading file: $e', error: true);
+      showSnack('Error picking or reading file: $e', error: true);
     }
   }
 
   void _performChunking() {
     try {
-      if (_originalFileContent.isEmpty ||
-          _originalFileContent ==
+      if (originalFileContent.isEmpty ||
+          originalFileContent ==
               'Select a text file to display its content here.') {
-        _showSnack('Please select a file first.', error: true);
+        showSnack('Please select a file first.', error: true);
         return;
       }
 
-      _chunks = TextChunkerService.chunkText(
-        originalContent: _originalFileContent,
-        method: _selectedChunkingMethod,
-        linesPerChunk: int.tryParse(_linesPerChunkController.text) ?? 10,
-        wordsPerChunk: int.tryParse(_wordsPerChunkController.text) ?? 100,
+      chunks = TextChunkerService.chunkText(
+        originalContent: originalFileContent,
+        method: selectedChunkingMethod,
+        linesPerChunk: int.tryParse(linesPerChunkController.text) ?? 10,
+        wordsPerChunk: int.tryParse(wordsPerChunkController.text) ?? 100,
         charactersPerChunk:
-            int.tryParse(_charactersPerChunkController.text) ?? 1000,
-        regexPattern: _regexPatternController.text,
-        overlap: int.tryParse(_overlapController.text) ?? 0,
+            int.tryParse(charactersPerChunkController.text) ?? 1000,
+        regexPattern: regexPatternController.text,
+        overlap: int.tryParse(overlapController.text) ?? 0,
       );
 
       setState(() {
-        _chunkedContent = _chunks
+        chunkedContent = chunks
             .asMap()
             .entries
             .map((e) => '--- Chunk ${e.key + 1} ---\n${e.value}')
             .join('\n\n');
-        _translatedContent = 'Ready to translate ${_chunks.length} chunks.';
-        _translatedChunks = null;
-        _translationProgress = 0.0;
+        translatedContent = 'Ready to translate ${chunks.length} chunks.';
+        translatedChunks = null;
+        translationProgress = 0.0;
 
         // Input tokens as sum over chunks for better accuracy
-        _inputTokens = _chunks.fold<int>(0, (sum, c) => sum + _countTokens(c));
-        _outputTokens = 0;
-        _lastResultTokens = 0;
+        inputTokens = chunks.fold<int>(0, (sum, c) => sum + _countTokens(c));
+        outputTokens = 0;
+        lastResultTokens = 0;
         _recomputeUsageCost();
       });
     } catch (e) {
-      _showSnack('Error during chunking: $e', error: true);
+      showSnack('Error during chunking: $e', error: true);
     }
   }
-
-  void _startMinuteMonitor() {
-    _minuteTimer?.cancel();
-    setState(() {
-      _rpmThisMinute = 0;
-      _tpmThisMinute = 0;
-      _monitoring = true;
-    });
-    _minuteTimer = Timer.periodic(const Duration(minutes: 1), (_) {
-      setState(() {
-        _rpmThisMinute = 0;
-        _tpmThisMinute = 0;
-      });
-    });
-  }
-
-  void _stopMinuteMonitor() {
-    _minuteTimer?.cancel();
-    setState(() {
-      _monitoring = false; // keep last counters visible until next run
-    });
-  }
-
- Future<void> _performTranslation() async {
-    if (_chunks.isEmpty) {
-      _showSnack('Please chunk the text before translating.', error: true);
+    Future<void> _performOcr() async {
+    if (selectedFilesForOcr.isEmpty) {
+      showSnack('No files selected for OCR.', error: true);
+      return;
+    }
+    // Note: Ensure your config page saves the Gemini API Key to translatorConfig.apiKey
+    if (translatorConfig.apiKey.isEmpty) {
+      showSnack('Gemini API key is not set in the configuration.',
+          error: true);
       return;
     }
 
     setState(() {
-      _isTranslating = true;
-      _translationProgress = 0.0;
-      _translatedChunks = List.filled(_chunks.length, null);
-      _translatedContent = 'Translating...';
+      isOcrProcessing = true;
+      ocrProgress = 0.0;
+      originalFileContent =
+          'Starting OCR process with Gemini for ${selectedFilesForOcr.length} files...';
+      chunkedContent = '';
+      translatedContent = '';
     });
 
-    _translationService.setApiKey();
-    _startMinuteMonitor();
-       int completedCount = 0;
     try {
-      await _translationService.translateChunksConcurrently(
-        chunks: _chunks,
+      final String combinedText = await _ocrService.processFiles(
+        files: selectedFilesForOcr,
+        apiKey: translatorConfig.geminiApi,
+   //  apiKey: translatorConfig.apiKey,
+        onProgress: (completed, total) {
+          setState(() {
+            ocrProgress = completed / total;
+          });
+        },
+      );
+
+      setState(() {
+        originalFileContent = combinedText.trim().isNotEmpty
+            ? combinedText
+            : 'OCR process finished, but no text was extracted.';
+        chunkedContent = 'Press "Chunk Text" to process.';
+        translatedContent = 'Translate chunks to see the result.';
+        chunks = [];
+        translatedChunks = null;
+        translationProgress = 0.0;
+        inputTokens = _countTokens(originalFileContent);
+        outputTokens = 0;
+        lastResultTokens = 0;
+        _recomputeUsageCost();
+        // Clear the selection after processing
+        selectedFilesForOcr = [];
+        fileName = 'OCR Completed. Content loaded.';
+      });
+    } catch (e) {
+      showSnack('An error occurred during OCR processing: $e', error: true);
+      setState(() {
+        originalFileContent =
+            'OCR failed. Please check your API key and network connection.';
+      });
+    } finally {
+      setState(() {
+        isOcrProcessing = false;
+      });
+    }
+  }
+  // void _startMinuteMonitor() {
+  //   minuteTimer?.cancel();
+  //   setState(() {
+  //     rpmThisMinute = 0;
+  //     tpmThisMinute = 0;
+  //     monitoring = true;
+  //   });
+  //   minuteTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+  //     setState(() {
+  //       rpmThisMinute = 0;
+  //       tpmThisMinute = 0;
+  //     });
+  //   });
+  // }
+
+  // void _stopMinuteMonitor() {
+  //   minuteTimer?.cancel();
+  //   setState(() {
+  //     monitoring = false; // keep last counters visible until next run
+  //   });
+  // }
+
+  Future<void> _performTranslation() async {
+    if (chunks.isEmpty) {
+      showSnack('Please chunk the text before translating.', error: true);
+      return;
+    }
+
+    setState(() {
+      isTranslating = true;
+      translationProgress = 0.0;
+      translatedChunks = List.filled(chunks.length, null);
+      translatedContent = 'Translating...';
+    });
+
+    translationService.setApiKey();
+    //  _startMinuteMonitor();
+    int completedCount = 0;
+    try {
+      await translationService.translateChunksConcurrently(
+        chunks: chunks,
         targetLanguage: translatorConfig.outputLang,
         onChunkTranslated: (index, translatedChunk) {
           setState(() {
-            _translatedChunks![index] = translatedChunk;
+            translatedChunks![index] = translatedChunk;
             completedCount++;
-            _translationProgress = completedCount / _chunks.length;
+            translationProgress = completedCount / chunks.length;
           });
-        }, batchSize: translatorConfig.batchN,
+        },
+        batchSize: translatorConfig.batchN,
       );
     } catch (e) {
-      _showSnack('Translation failed: $e', error: true);
+      showSnack('Translation failed: $e', error: true);
     } finally {
       setState(() {
-        _isTranslating = false;
-        _translatedContent =
-            _translatedChunks?.where((s) => s != null).join('\n\n') ??
+        isTranslating = false;
+        translatedContent =
+            translatedChunks?.where((s) => s != null).join('\n\n') ??
             'Translation finished with errors.';
-        if (_translatedContent.trim().isEmpty &&
-            (_translatedChunks?.isNotEmpty ?? false)) {
-          _translatedContent =
+        if (translatedContent.trim().isEmpty &&
+            (translatedChunks?.isNotEmpty ?? false)) {
+          translatedContent =
               'Translation finished, but content is empty. Check API key or response.';
         }
       });
@@ -298,28 +386,27 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
     if (!Platform.isAndroid) return true;
     final status = await Permission.storage.request();
     if (status.isGranted || status.isLimited) return true;
-    _showSnack(
+    showSnack(
       'Storage permission denied. Trying SAF-based save...',
       error: false,
     );
     return false;
-    // SAF saving handled by file_picker save dialog when permission is denied.
   }
 
   Future<void> _saveResult() async {
     final String contentToSave =
-        _translatedContent.isNotEmpty &&
-            _translatedContent != 'Translated content will appear here.'
-        ? _translatedContent
-        : (_chunkedContent.isNotEmpty &&
-                  _chunkedContent !=
+        translatedContent.isNotEmpty &&
+            translatedContent != 'Translated content will appear here.'
+        ? translatedContent
+        : (chunkedContent.isNotEmpty &&
+                  chunkedContent !=
                       'Chunked content will appear here after processing.'
-              ? _chunkedContent
-              : _originalFileContent);
+              ? chunkedContent
+              : originalFileContent);
 
     if (contentToSave.isEmpty ||
         contentToSave == 'Select a text file to display its content here.') {
-      _showSnack(
+      showSnack(
         'No content to save. Please load a file and process it.',
         error: true,
       );
@@ -338,39 +425,49 @@ class _ChunkerInterfaceandState extends State<ChunkerInterfaceand> {
                 leading: const Icon(Icons.picture_as_pdf),
                 title: const Text('Export as PDF'),
                 onTap: () async {
-                 // ... inside the 'Export as PDF' ListTile onTap callback
-final String? dirPath = await FilePicker.platform.getDirectoryPath();
-if (dirPath == null) return;
-final suggestedBase = (_fileName?.replaceAll(RegExp(r'\.[^.]+$'), '') ?? 'output');
-final pdfPath = p.join(dirPath, '$suggestedBase.pdf');
+                  // ... inside the 'Export as PDF' ListTile onTap callback
+                  final String? dirPath = await FilePicker.platform
+                      .getDirectoryPath();
+                  if (dirPath == null) return;
+                  final suggestedBase =
+                      (fileName?.replaceAll(RegExp(r'\.[^.]+$'), '') ??
+                      'output');
+                  final pdfPath = p.join(dirPath, '$suggestedBase.pdf');
 
-final PdfDocument document = PdfDocument();
-final PdfPage page = document.pages.add();
+                  final PdfDocument document = PdfDocument();
+                  final PdfPage page = document.pages.add();
 
-// Use PdfTextElement for proper text wrapping and pagination
-final PdfTextElement textElement = PdfTextElement(
-  text: contentToSave,
-  font: PdfStandardFont(PdfFontFamily.helvetica, 12),
-  brush: PdfSolidBrush(PdfColor(0, 0, 0)),
-);
+                  // Use PdfTextElement for proper text wrapping and pagination
+                  final PdfTextElement textElement = PdfTextElement(
+                    text: contentToSave,
+                    font: PdfStandardFont(PdfFontFamily.helvetica, 12),
+                    brush: PdfSolidBrush(PdfColor(0, 0, 0)),
+                  );
 
-// Use a layout format that automatically paginates
-final PdfLayoutFormat layoutFormat = PdfLayoutFormat(
-  layoutType: PdfLayoutType.paginate,
-);
+                  // Use a layout format that automatically paginates
+                  final PdfLayoutFormat layoutFormat = PdfLayoutFormat(
+                    layoutType: PdfLayoutType.paginate,
+                  );
 
-// Draw the text element on the page
-textElement.draw(
-  page: page,
-  bounds: Rect.fromLTWH(0, 0, page.getClientSize().width, page.getClientSize().height),
-  format: layoutFormat,
-);
+                  // Draw the text element on the page
+                  textElement.draw(
+                    page: page,
+                    bounds: Rect.fromLTWH(
+                      0,
+                      0,
+                      page.getClientSize().width,
+                      page.getClientSize().height,
+                    ),
+                    format: layoutFormat,
+                  );
 
-// Save the document to the file
-File(pdfPath).writeAsBytes(await document.save());
-document.dispose();
+                  // Save the document to the file
+                  await File(
+                    pdfPath,
+                  ).writeAsBytes(await document.saveAsBytes());
+                  document.dispose();
 
-if (mounted) Navigator.of(context).pop('pdf');
+                  if (mounted) Navigator.of(context).pop('pdf');
                 },
               ),
               ListTile(
@@ -381,7 +478,7 @@ if (mounted) Navigator.of(context).pop('pdf');
                       .getDirectoryPath();
                   if (dirPath == null) return;
                   final suggestedBase =
-                      (_fileName?.replaceAll(RegExp(r'\.[^.]+$'), '') ??
+                      (fileName?.replaceAll(RegExp(r'\.[^.]+$'), '') ??
                       'output');
                   await _ensureStoragePermission();
                   final txtPath = p.join(dirPath, '$suggestedBase.txt');
@@ -399,17 +496,7 @@ if (mounted) Navigator.of(context).pop('pdf');
     if (exportType == null) return;
   }
 
-  void _showSnack(String message, {bool error = false}) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: error ? Colors.red.shade700 : Colors.green.shade600,
-        duration: const Duration(seconds: 4),
-      ),
-    );
-  }
-
-  Widget _monitorBar() {
+  Widget monitorBar(BuildContext context) {
     final styleLabel = Theme.of(context).textTheme.labelSmall;
     final styleValue = Theme.of(context).textTheme.labelSmall?.copyWith(
       fontFeatures: const [FontFeature.tabularFigures()],
@@ -443,16 +530,16 @@ if (mounted) Navigator.of(context).pop('pdf');
       runSpacing: -6,
       crossAxisAlignment: WrapCrossAlignment.center,
       children: [
-        chip('Input tok', '$_inputTokens', icon: Icons.input),
-        chip('Output tok', '$_outputTokens', icon: Icons.outbond),
-        chip('Last result tok', '$_lastResultTokens', icon: Icons.history),
-        chip('Usage', _usageCost.toStringAsFixed(4), icon: Icons.payments),
-        chip('RPM (min)', '$_rpmThisMinute', icon: Icons.av_timer),
-        chip('TPM (min)', '$_tpmThisMinute', icon: Icons.speed),
+        chip('Input tok', '$inputTokens', icon: Icons.input),
+        //  chip('Output tok', '$outputTokens', icon: Icons.outbond),
+        //  chip('Last result tok', '$lastResultTokens', icon: Icons.history),
+        chip('Usage', usageCost.toStringAsFixed(4), icon: Icons.payments),
+        //  chip('RPM (min)', '$rpmThisMinute', icon: Icons.av_timer),
+        //   chip('TPM (min)', '$tpmThisMinute', icon: Icons.speed),
         chip(
           'Status',
-          _monitoring ? 'monitoring' : 'idle',
-          icon: _monitoring ? Icons.play_arrow : Icons.pause,
+          monitoring ? 'monitoring' : 'idle',
+          icon: monitoring ? Icons.play_arrow : Icons.pause,
         ),
       ],
     );
@@ -464,14 +551,57 @@ if (mounted) Navigator.of(context).pop('pdf');
       padding: const EdgeInsets.all(16.0),
       child: Column(
         children: <Widget>[
-          // Top row: File and Config button
+           Row(
+            children: [
+              Checkbox(
+                value: isOcrEnabled,
+                onChanged: (bool? newValue) {
+                  setState(() {
+                    isOcrEnabled = newValue ?? false;
+                    // Reset selections when switching modes
+                    selectedFilesForOcr = [];
+                    fileName = 'No file selected';
+                  });
+                },
+              ),
+              const Text('Enable OCR (for handwritten PDFs & images)'),
+            ],
+          ),
+          const SizedBox(height: 20),
           Row(
             children: [
               Expanded(
                 child: FilledButton.icon(
-                  onPressed: _pickFile,
+                  onPressed: () async {
+                    if (isOcrEnabled) {
+                      FilePickerResult? result = await FilePicker.platform
+                          .pickFiles(
+                        type: FileType.custom,
+                        allowedExtensions: ['pdf', 'png', 'jpg', 'jpeg'],
+                        allowMultiple: true,
+                        withData: true,
+                      );
+                      if (result != null) {
+                        setState(() {
+                          selectedFilesForOcr = result.files;
+                          fileName =
+                              '${result.files.length} file(s) selected for OCR.';
+                        });
+                      }
+                    } else {
+                      FilePickerResult? result = await FilePicker.platform
+                          .pickFiles(
+                        type: FileType.any,
+                        withData: true,
+                      );
+                      if (result != null) {
+                        await pickFile(result);
+                      }
+                    }
+                  },
                   icon: const Icon(Icons.folder_open),
-                  label: const Text('Select File'),
+                  label: Text(
+                      isOcrEnabled ? 'Select Files for OCR' : 'Select File'),
                   style: const ButtonStyle(
                     minimumSize: WidgetStatePropertyAll(Size.fromHeight(48)),
                   ),
@@ -479,9 +609,8 @@ if (mounted) Navigator.of(context).pop('pdf');
               ),
               const SizedBox(width: 10),
               FilledButton.tonalIcon(
-                onPressed: () => Navigator.of(
-                  context,
-                ).push(MaterialPageRoute(builder: (_) => const ConfigPage())),
+                onPressed: () => Navigator.of(context)
+                    .push(MaterialPageRoute(builder: (_) => const ConfigPage())),
                 icon: const Icon(Icons.settings),
                 label: const Text('Open Config'),
               ),
@@ -491,25 +620,36 @@ if (mounted) Navigator.of(context).pop('pdf');
           Align(
             alignment: Alignment.centerLeft,
             child: Text(
-              _fileName ?? 'No file selected',
+              fileName ?? 'No file selected',
               overflow: TextOverflow.ellipsis,
               maxLines: 2,
             ),
           ),
-          const SizedBox(height: 12),
-
-
+          SizedBox(height: 12),
+    if (isOcrEnabled && selectedFilesForOcr.isNotEmpty) ...[
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: isOcrProcessing ? null : _performOcr,
+                icon: const Icon(Icons.document_scanner),
+                label: const Text('Perform OCR'),
+                style: ButtonStyle(
+                  backgroundColor: WidgetStatePropertyAll(Colors.orange.shade700),
+                  minimumSize: const WidgetStatePropertyAll(Size.fromHeight(48)),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
           ElevatedButton(
             child: Text('Target Language ${translatorConfig.outputLang}'),
             onPressed: () {
               openLanguagePickerDialog(context);
-              setState(() {
-                
-              });
+              setState(() {});
             },
           ),
-          const SizedBox(height: 12),
-          const Divider(height: 24),
+          SizedBox(height: 8),
+          Divider(height: 12),
 
           // Chunking options
           Align(
@@ -522,9 +662,9 @@ if (mounted) Navigator.of(context).pop('pdf');
                   label: Text(
                     method.name[0].toUpperCase() + method.name.substring(1),
                   ),
-                  selected: _selectedChunkingMethod == method,
+                  selected: selectedChunkingMethod == method,
                   onSelected: (selected) =>
-                      setState(() => _selectedChunkingMethod = method),
+                      setState(() => selectedChunkingMethod = method),
                 );
               }).toList(),
             ),
@@ -549,7 +689,7 @@ if (mounted) Navigator.of(context).pop('pdf');
               const SizedBox(width: 12),
               Expanded(
                 child: FilledButton.icon(
-                  onPressed: _isTranslating ? null : _performTranslation,
+                  onPressed: isTranslating ? null : _performTranslation,
                   icon: const Icon(Icons.translate),
                   label: const Text('Translate Chunks'),
                   style: ButtonStyle(
@@ -584,22 +724,39 @@ if (mounted) Navigator.of(context).pop('pdf');
               ),
             ],
           ),
-          if (_isTranslating)
+             if (isOcrProcessing)
             Padding(
               padding: const EdgeInsets.only(top: 12.0),
               child: Column(
                 children: [
-                  LinearProgressIndicator(value: _translationProgress),
+                  LinearProgressIndicator(
+                    value: ocrProgress,
+                    backgroundColor: Colors.orange.shade900,
+                    color: Colors.orangeAccent,
+                  ),
                   const SizedBox(height: 4),
                   Text(
-                    'Translating... ${(_translationProgress * 100).toStringAsFixed(0)}%',
+                    'Performing OCR... ${(ocrProgress * 100).toStringAsFixed(0)}%',
+                  ),
+                ],
+              ),
+            ),
+          if (isTranslating)
+            Padding(
+              padding: const EdgeInsets.only(top: 12.0),
+              child: Column(
+                children: [
+                  LinearProgressIndicator(value: translationProgress),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Translating... ${(translationProgress * 100).toStringAsFixed(0)}%',
                   ),
                 ],
               ),
             ),
 
           const SizedBox(height: 10),
-          _monitorBar(),
+          monitorBar(context),
         ],
       ),
     );
@@ -620,15 +777,15 @@ if (mounted) Navigator.of(context).pop('pdf');
               children: [
                 ContentDisplayBox(
                   title: 'Original Content',
-                  content: _originalFileContent,
+                  content: originalFileContent,
                 ),
                 ContentDisplayBox(
-                  title: 'Chunked Content (${_chunks.length} chunks)',
-                  content: _chunkedContent,
+                  title: 'Chunked Content (${chunks.length} chunks)',
+                  content: chunkedContent,
                 ),
                 ContentDisplayBox(
                   title: 'Translated Content',
-                  content: _translatedContent,
+                  content: translatedContent,
                 ),
               ],
             ),
@@ -639,74 +796,7 @@ if (mounted) Navigator.of(context).pop('pdf');
 
     return MaterialApp(
       title: 'File Chunker & Translator',
-      theme: ThemeData(
-        primarySwatch: Colors.blueGrey,
-        brightness: Brightness.dark, // Awesome style often includes dark theme
-        visualDensity: VisualDensity.adaptivePlatformDensity,
-        appBarTheme: const AppBarTheme(
-          elevation: 0,
-          centerTitle: true,
-          backgroundColor: Colors.black12,
-        ),
-        scaffoldBackgroundColor: Colors.black87,
-        cardColor: Colors.black26, // For cards/sections
-        textTheme: Theme.of(context).textTheme.apply(
-          bodyColor: Colors.white70,
-          displayColor: Colors.white,
-        ),
-        inputDecorationTheme: InputDecorationTheme(
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: BorderSide.none,
-          ),
-          filled: true,
-          fillColor: Colors.white.withOpacity(0.08),
-          hintStyle: TextStyle(color: Colors.white30),
-          labelStyle: TextStyle(color: Colors.white70),
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 12,
-          ),
-        ),
-        switchTheme: SwitchThemeData(
-          thumbColor: MaterialStateProperty.resolveWith((states) {
-            if (states.contains(MaterialState.selected)) {
-              return Colors.tealAccent;
-            }
-            return Colors.grey[600];
-          }),
-          trackColor: MaterialStateProperty.resolveWith((states) {
-            if (states.contains(MaterialState.selected)) {
-              return Colors.tealAccent.withOpacity(0.5);
-            }
-            return Colors.grey[700];
-          }),
-        ),
-        sliderTheme: SliderThemeData(
-          trackHeight: 4,
-          activeTrackColor: Colors.tealAccent,
-          inactiveTrackColor: Colors.white.withOpacity(0.3),
-          thumbColor: Colors.tealAccent,
-          overlayColor: Colors.tealAccent.withOpacity(0.2),
-          valueIndicatorColor: Colors.tealAccent,
-          valueIndicatorTextStyle: TextStyle(color: Colors.black),
-          showValueIndicator: ShowValueIndicator.always,
-        ),
-        elevatedButtonTheme: ElevatedButtonThemeData(
-          style: ElevatedButton.styleFrom(
-            backgroundColor: Colors.teal, // Button background color
-            foregroundColor: Colors.white, // Button text color
-            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(10),
-            ),
-            textStyle: const TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        ),
-      ),
+      theme: AppThemes.awesomeDarkTheme,
       home: Scaffold(
         appBar: AppBar(
           title: const Text('File Chunker & Translator'),
@@ -749,58 +839,6 @@ if (mounted) Navigator.of(context).pop('pdf');
           ),
         ),
       ),
-    );
-  }
-
-  Widget _buildChunkingInputs() {
-    return Column(
-      children: [
-        if (_selectedChunkingMethod == ChunkingMethod.lines)
-          TextField(
-            controller: _linesPerChunkController,
-            decoration: const InputDecoration(
-              labelText: 'Lines per chunk',
-              prefixIcon: Icon(Icons.wrap_text),
-            ),
-            keyboardType: TextInputType.number,
-          )
-        else if (_selectedChunkingMethod == ChunkingMethod.words)
-          TextField(
-            controller: _wordsPerChunkController,
-            decoration: const InputDecoration(
-              labelText: 'Words per chunk',
-              prefixIcon: Icon(Icons.format_list_bulleted),
-            ),
-            keyboardType: TextInputType.number,
-          )
-        else if (_selectedChunkingMethod == ChunkingMethod.characters)
-          TextField(
-            controller: _charactersPerChunkController,
-            decoration: const InputDecoration(
-              labelText: 'Characters per chunk',
-              prefixIcon: Icon(Icons.text_increase),
-            ),
-            keyboardType: TextInputType.number,
-          )
-        else
-          TextField(
-            controller: _regexPatternController,
-            decoration: const InputDecoration(
-              labelText: 'Regex Pattern',
-              prefixIcon: Icon(Icons.functions),
-            ),
-          ),
-        const SizedBox(height: 8),
-        if (_selectedChunkingMethod != ChunkingMethod.regex)
-          TextField(
-            controller: _overlapController,
-            decoration: InputDecoration(
-              labelText: 'Overlap (${_selectedChunkingMethod.name})',
-              prefixIcon: const Icon(Icons.flip),
-            ),
-            keyboardType: TextInputType.number,
-          ),
-      ],
     );
   }
 }

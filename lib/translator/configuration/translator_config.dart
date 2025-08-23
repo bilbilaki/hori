@@ -41,12 +41,15 @@ class TranslatorConfig extends HiveObject {
   @HiveField(14)
   late String modelId;
 
-
   @HiveField(15)
   late String systemPrompt;
 
   @HiveField(16)
   late double temp;
+  @HiveField(17)
+  late String geminiApi;
+  @HiveField(18)
+  late String geminiPrompt;
   TranslatorConfig();
   TranslatorConfig.withDefaults() {
     apiKey = '';
@@ -64,8 +67,7 @@ class TranslatorConfig extends HiveObject {
     batchN = 5;
     outputFormat = 'plain text';
     modelId = 'gemini-2.5-flash-lite';
-    systemPrompt =
-        '''You are an advanced translator.  
+    systemPrompt = '''You are an advanced translator.  
 
 1. Detect the topic/genre of the input (novel, poem, math, code, email, chat, news, etc.).  
 2. Adapt style to match that topic:  
@@ -80,5 +82,7 @@ class TranslatorConfig extends HiveObject {
 Translate input to this  : 
 ''';
     temp = 0.1;
+    geminiApi = '';
+    geminiPrompt = 'Extract all text content from the following document. This includes printed text, handwritten notes, and text within images. Preserve the original structure, paragraphs, and line breaks as best as possible. Output the result as plain text.';
   }
 }
